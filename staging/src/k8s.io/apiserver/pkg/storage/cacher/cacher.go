@@ -62,6 +62,10 @@ var (
 )
 
 const (
+	// initialListWait bounds how long a request waits for the cache to become
+	// ready when Config.WaitForInitialList is set.
+	initialListWait = 250 * time.Millisecond
+
 	// storageWatchListPageSize is the cacher's request chunk size of
 	// initial and resync watch lists to storage.
 	storageWatchListPageSize = int64(10000)
@@ -93,6 +97,11 @@ type Config struct {
 	// EventsHistoryWindow specifies minimum history duration that storage is keeping.
 	// If lower than DefaultEventFreshDuration, the cache creation will fail.
 	EventsHistoryWindow time.Duration
+
+	// WaitForInitialList makes requests that find the cache not ready wait
+	// briefly for it instead of being rejected with 429 immediately. Intended
+	// for caches built on demand by the first request for the resource.
+	WaitForInitialList bool
 
 	// The Cache will be caching objects of a given Type and assumes that they
 	// are all stored under ResourcePrefix directory in the underlying database.
@@ -280,6 +289,8 @@ type Cacher struct {
 	// ready needs to be set to true when the cacher is ready to use after
 	// initialization.
 	ready *ready
+	// waitForInitialList, see Config.WaitForInitialList.
+	waitForInitialList bool
 
 	// Underlying storage.Interface.
 	storage storage.Interface
@@ -389,16 +400,17 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 		return nil, fmt.Errorf("resourcePrefix needs to start from /")
 	}
 	cacher := &Cacher{
-		resourcePrefix: resourcePrefix,
-		ready:          newReady(config.Clock),
-		storage:        config.Storage,
-		objectType:     objType,
-		groupResource:  config.GroupResource,
-		versioner:      config.Versioner,
-		newFunc:        config.NewFunc,
-		newListFunc:    config.NewListFunc,
-		indexedTrigger: indexedTrigger,
-		watcherIdx:     0,
+		resourcePrefix:     resourcePrefix,
+		ready:              newReady(config.Clock),
+		waitForInitialList: config.WaitForInitialList,
+		storage:            config.Storage,
+		objectType:         objType,
+		groupResource:      config.GroupResource,
+		versioner:          config.Versioner,
+		newFunc:            config.NewFunc,
+		newListFunc:        config.NewListFunc,
+		indexedTrigger:     indexedTrigger,
+		watcherIdx:         0,
 		watchers: indexedWatchers{
 			allWatchers:   make(map[namespacedName]watchersMap),
 			valueWatchers: make(map[string]watchersMap),
@@ -528,6 +540,7 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 		return nil, err
 	}
 
+	c.waitForInitialListIfEnabled(ctx)
 	readyGeneration, downtime, err := c.ready.checkAndReadGeneration()
 	if err != nil {
 		return nil, errors.NewTooManyRequests(err.Error(), calculateRetryAfterForUnreadyCache(downtime))
@@ -765,6 +778,7 @@ func (c *Cacher) GetList(ctx context.Context, key string, opts storage.ListOptio
 		attribute.Stringer("type", c.groupResource))
 	defer span.End(500 * time.Millisecond)
 
+	c.waitForInitialListIfEnabled(ctx)
 	if downtime, err := c.ready.check(); err != nil {
 		// If Cacher is not initialized, reject List requests
 		// as described in https://kep.k8s.io/4568
@@ -1362,6 +1376,17 @@ func (c *Cacher) waitUntilWatchCacheFreshAndForceAllEvents(ctx context.Context, 
 // Wait blocks until the cacher is Ready or Stopped, it returns an error if Stopped.
 func (c *Cacher) Wait(ctx context.Context) error {
 	return c.ready.wait(ctx)
+}
+
+// waitForInitialListIfEnabled gives the cache up to initialListWait to become
+// ready when Config.WaitForInitialList is set; callers still check readiness.
+func (c *Cacher) waitForInitialListIfEnabled(ctx context.Context) {
+	if !c.waitForInitialList {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, initialListWait)
+	defer cancel()
+	_ = c.ready.wait(ctx)
 }
 
 // setInitialEventsEndBookmarkIfRequested sets initialEventsEndBookmark field in watchCacheInterval for watchlist request

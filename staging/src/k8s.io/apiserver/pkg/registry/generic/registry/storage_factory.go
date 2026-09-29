@@ -58,6 +58,7 @@ func StorageWithCacher() generic.StorageDecorator {
 			Versioner:           storage.APIObjectVersioner{},
 			GroupResource:       storageConfig.GroupResource,
 			EventsHistoryWindow: storageConfig.EventsHistoryWindow,
+			WaitForInitialList:  storageConfig.WaitForInitialList,
 			ResourcePrefix:      resourcePrefix,
 			KeyFunc:             cacheKeyFunc,
 			NewFunc:             newFunc,

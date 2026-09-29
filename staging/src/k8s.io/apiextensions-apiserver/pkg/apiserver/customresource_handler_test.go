@@ -50,6 +50,7 @@ import (
 	serializerjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
@@ -1071,4 +1072,27 @@ func getOpenAPISpecFromFile() (*spec.Swagger, error) {
 	}
 
 	return staticSpec, nil
+}
+
+func TestCreatedSinceStartTracksLiveCRDCreates(t *testing.T) {
+	handler := &crdHandler{createdSinceStart: sets.New[types.UID]()}
+	handler.customStorage.Store(crdStorageMap{})
+
+	replayed := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "old.example.com", UID: "old"}}
+	created := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "new.example.com", UID: "new"}}
+
+	handler.createCustomResourceDefinition(replayed, true)
+	handler.createCustomResourceDefinition(created, false)
+
+	if handler.wasCreatedSinceStart(replayed.UID) {
+		t.Error("CRD replayed from the informer's initial list must not be marked as created since start")
+	}
+	if !handler.wasCreatedSinceStart(created.UID) {
+		t.Error("CRD added after the initial list must be marked as created since start")
+	}
+
+	handler.markCreatedSinceStart(created.UID, false)
+	if handler.wasCreatedSinceStart(created.UID) {
+		t.Error("deleted CRD must be forgotten")
+	}
 }

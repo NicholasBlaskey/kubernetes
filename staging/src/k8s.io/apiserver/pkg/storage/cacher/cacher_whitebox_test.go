@@ -70,8 +70,13 @@ import (
 )
 
 func newTestCacherWithoutSyncing(s storage.Interface, c clock.WithTicker) (*Cacher, storage.Versioner, error) {
+	cacher, err := NewCacherFromConfig(newTestCacherConfig(s, c))
+	return cacher, storage.APIObjectVersioner{}, err
+}
+
+func newTestCacherConfig(s storage.Interface, c clock.WithTicker) Config {
 	prefix := "/pods/"
-	config := Config{
+	return Config{
 		Storage:             s,
 		Versioner:           storage.APIObjectVersioner{},
 		GroupResource:       schema.GroupResource{Resource: "pods"},
@@ -95,9 +100,6 @@ func newTestCacherWithoutSyncing(s storage.Interface, c clock.WithTicker) (*Cach
 		Codec:       codecs.LegacyCodec(examplev1.SchemeGroupVersion),
 		Clock:       c,
 	}
-	cacher, err := NewCacherFromConfig(config)
-
-	return cacher, storage.APIObjectVersioner{}, err
 }
 
 func newTestCacher(s storage.Interface) (*Cacher, storage.Versioner, error) {
@@ -950,6 +952,77 @@ func TestWatchNotHangingOnStartupFailure(t *testing.T) {
 	_, err = cacher.Watch(ctx, "/pods/ns", storage.ListOptions{ResourceVersion: "0"})
 	if err == nil || !strings.Contains(err.Error(), "storage is (re)initializing") {
 		t.Errorf("Unexpected error: %#v", err)
+	}
+}
+
+// newWaitForInitialListCacher returns a cacher with WaitForInitialList set whose
+// initial list from the backing storage blocks until releaseList is closed.
+func newWaitForInitialListCacher(t *testing.T) (*Cacher, chan struct{}) {
+	releaseList := make(chan struct{})
+	backingStorage := &cachertesting.MockStorage{
+		GetListFn: func(ctx context.Context, _ string, _ storage.ListOptions, listObj runtime.Object) error {
+			select {
+			case <-releaseList:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			listObj.(*example.PodList).ListMeta = metav1.ListMeta{ResourceVersion: "100"}
+			return nil
+		},
+	}
+	config := newTestCacherConfig(backingStorage, clock.RealClock{})
+	config.WaitForInitialList = true
+	cacher, err := NewCacherFromConfig(config)
+	if err != nil {
+		t.Fatalf("Couldn't create cacher: %v", err)
+	}
+	return cacher, releaseList
+}
+
+func TestWatchWaitsForInitialList(t *testing.T) {
+	cacher, releaseList := newWaitForInitialListCacher(t)
+	defer cacher.Stop()
+
+	type result struct {
+		w   watch.Interface
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		w, err := cacher.Watch(context.Background(), "/pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
+		done <- result{w, err}
+	}()
+
+	select {
+	case r := <-done:
+		t.Fatalf("Watch returned before the initial list completed: w=%v err=%v", r.w, r.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseList)
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Unexpected error: %v", r.err)
+		}
+		r.w.Stop()
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatal("Watch did not return after the initial list completed")
+	}
+}
+
+func TestWatchRejectedAfterInitialListWait(t *testing.T) {
+	cacher, releaseList := newWaitForInitialListCacher(t)
+	defer cacher.Stop()
+	defer close(releaseList)
+
+	start := time.Now()
+	_, err := cacher.Watch(context.Background(), "/pods/ns", storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
+	if err == nil || !strings.Contains(err.Error(), "storage is (re)initializing") {
+		t.Fatalf("Expected 429 after the wait window, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < initialListWait {
+		t.Fatalf("Watch was rejected after %v, before the %v wait window elapsed", elapsed, initialListWait)
 	}
 }
 

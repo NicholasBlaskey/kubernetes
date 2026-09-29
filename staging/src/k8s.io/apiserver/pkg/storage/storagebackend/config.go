@@ -83,6 +83,11 @@ type Config struct {
 	DBMetricPollInterval time.Duration
 	// EventsHistoryWindow specifies minimum history duration that storage is keeping.
 	EventsHistoryWindow time.Duration
+	// WaitForInitialList lets requests that arrive while a freshly constructed
+	// watch cache is still doing its initial list wait briefly for it instead
+	// of being rejected. Intended for storage built on demand by the first
+	// request for the resource (e.g. custom resources).
+	WaitForInitialList bool
 	// HealthcheckTimeout specifies the timeout used when checking health
 	HealthcheckTimeout time.Duration
 	// ReadycheckTimeout specifies the timeout used when checking readiness

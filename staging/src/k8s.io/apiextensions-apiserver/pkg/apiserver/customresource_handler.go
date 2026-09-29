@@ -99,6 +99,11 @@ type crdHandler struct {
 	// which is suited for most read and rarely write cases
 	customStorage atomic.Value
 
+	// createdSinceStart holds the UIDs of CRDs created after this server
+	// started, as opposed to replayed from the informer's initial list.
+	createdSinceStartLock sync.Mutex
+	createdSinceStart     sets.Set[types.UID]
+
 	crdLister listers.CustomResourceDefinitionLister
 
 	delegate          http.Handler
@@ -198,10 +203,14 @@ func NewCustomResourceDefinitionHandler(
 		staticOpenAPISpec:       staticOpenAPISpec,
 		maxRequestBodyBytes:     maxRequestBodyBytes,
 	}
-	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	ret.createdSinceStart = sets.New[types.UID]()
+	crdInformer.Informer().AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
 		AddFunc:    ret.createCustomResourceDefinition,
 		UpdateFunc: ret.updateCustomResourceDefinition,
 		DeleteFunc: func(obj interface{}) {
+			if crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition); ok {
+				ret.markCreatedSinceStart(crd.UID, false)
+			}
 			ret.removeDeadStorage()
 		},
 	})
@@ -456,8 +465,11 @@ func (r *crdHandler) serveScale(w http.ResponseWriter, req *http.Request, reques
 }
 
 // createCustomResourceDefinition removes potentially stale storage so it gets re-created
-func (r *crdHandler) createCustomResourceDefinition(obj interface{}) {
+func (r *crdHandler) createCustomResourceDefinition(obj interface{}, isInInitialList bool) {
 	crd := obj.(*apiextensionsv1.CustomResourceDefinition)
+	if !isInInitialList {
+		r.markCreatedSinceStart(crd.UID, true)
+	}
 	r.customStorageLock.Lock()
 	defer r.customStorageLock.Unlock()
 	// this could happen if the create event is merged from create-update events
@@ -511,6 +523,22 @@ func (r *crdHandler) updateCustomResourceDefinition(oldObj, newObj interface{}) 
 
 	klog.V(4).Infof("Updating customresourcedefinition %s", newCRD.Name)
 	r.removeStorage_locked(newCRD.UID)
+}
+
+func (r *crdHandler) markCreatedSinceStart(uid types.UID, created bool) {
+	r.createdSinceStartLock.Lock()
+	defer r.createdSinceStartLock.Unlock()
+	if created {
+		r.createdSinceStart.Insert(uid)
+	} else {
+		r.createdSinceStart.Delete(uid)
+	}
+}
+
+func (r *crdHandler) wasCreatedSinceStart(uid types.UID) bool {
+	r.createdSinceStartLock.Lock()
+	defer r.createdSinceStartLock.Unlock()
+	return r.createdSinceStart.Has(uid)
 }
 
 // removeStorage_locked removes the cached storage with the given uid as key from the storage map. This function
@@ -870,6 +898,7 @@ func (r *crdHandler) getOrCreateServingInfoFor(uid types.UID, name string) (*crd
 			),
 			crdConversionRESTOptionsGetter{
 				RESTOptionsGetter:     r.restOptionsGetter,
+				waitForInitialList:    r.wasCreatedSinceStart(crd.UID),
 				converter:             safeConverter,
 				decoderVersion:        schema.GroupVersion{Group: crd.Spec.Group, Version: v.Name},
 				encoderVersion:        schema.GroupVersion{Group: crd.Spec.Group, Version: storageVersion},
@@ -1267,12 +1296,16 @@ type crdConversionRESTOptionsGetter struct {
 	structuralSchemas     map[string]*structuralschema.Structural // by version
 	structuralSchemaGK    schema.GroupKind
 	preserveUnknownFields bool
+	// waitForInitialList is set for CRDs created since this server started;
+	// their storage is being built by the first request for the type.
+	waitForInitialList bool
 }
 
 func (t crdConversionRESTOptionsGetter) GetRESTOptions(resource schema.GroupResource, example runtime.Object) (generic.RESTOptions, error) {
 	// Explicitly ignore example, we override storageconfig below
 	ret, err := t.RESTOptionsGetter.GetRESTOptions(resource, nil)
 	if err == nil {
+		ret.StorageConfig.WaitForInitialList = t.waitForInitialList
 		d := schemaCoercingDecoder{delegate: ret.StorageConfig.Codec, validator: unstructuredSchemaCoercer{
 			// drop invalid fields while decoding old CRs (before we haven't had any ObjectMeta validation)
 			dropInvalidMetadata:   true,
